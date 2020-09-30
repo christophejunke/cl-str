@@ -2,6 +2,11 @@
 
 (defpackage str
   (:use :cl)
+  (:import-from :alexandria
+                :clamp
+                :ensure-list
+                :if-let
+                :once-only)
   (:import-from :cl-change-case
                 :no-case
                 :camel-case
@@ -115,9 +120,13 @@
    :*ellipsis*
    :*pad-char*
    :*pad-side*
+   :*sharedp*
    :version
    :+version+
-   :?))
+   :?
+   
+   :invalid-index
+   ))
 
 (in-package :str)
 
@@ -128,24 +137,113 @@
   "Padding character to use with `pad'. It can be a string of one character.")
 (defparameter *pad-side* :right
   "The side of the string to add padding characters to. Can be one of :right, :left and :center.")
+(defparameter *sharedp* nil
+  "When NIL, functions always return fresh strings; otherwise, they may share storage with their inputs.")
+(defparameter *index-mode* :clamp
+  "Behavior for out-of-bounds indices. Can be one of :clamp, :strict, :wrap-clamp, :wrap-strict, or a function accepting a string, an integer which returns a valid index.")
 
 (defvar *whitespaces* '(#\Space #\Newline #\Backspace #\Tab
                         #\Linefeed #\Page #\Return #\Rubout))
 
 (defvar +version+ "0.18.1")
 
+(define-condition invalid-index (type-error)
+  ((string :initarg :string :reader invalid-index-string)
+   (index :initform *index-mode* :initarg :index :reader invalid-index-index)
+   (mode :initarg :mode :reader invalid-index-mode))
+  (:report (lambda (condition stream)
+             (format stream
+                     "Invalid index ~d in string ~s in mode ~s"
+                     (invalid-index-index condition)
+                     (invalid-index-string condition)
+                     (invalid-index-mode condition)))))
+
+(defun invalid-index (string index &optional (mode *index-mode*))
+  (error 'invalid-index :string string :index index :mode mode))
+
+(defun index (string index &optional (mode *index-mode*))
+  (with-accessors ((length length)) string
+    (cond
+      ((null index) length)
+      ((<= 0 index length) index)
+      ((functionp mode) (funcall mode string index))
+      (t (case mode
+           (:strict (invalid-index string index mode))
+           (:clamp (clamp index 0 length))
+           (t (multiple-value-bind (parts mod) (floor index length)
+                (if (< -2 parts 1)
+                    mod
+                    (ecase mode
+                      (:wrap-strict (invalid-index string index mode))
+                      (:wrap-clamp (if (< parts 0) 0 length)))))))))))
+
+(loop
+   for m in '(:clamp :wrap-clamp :strict :wrap-strict)
+   collect 
+     (cons m 
+           (loop 
+              for i from -7 upto 7 
+              collect (ignore-errors (index "abcde" i m)))))
+
+(defmacro with-indices ((&rest indices) string &body body)
+  (once-only (string)
+    (flet ((binding (index)
+             (destructuring-bind (name &optional default) (ensure-list index)
+               (let ((index-expr (if default `(or ,name ,default) name)))
+                 `(,name (index ,string ,index-expr))))))
+      `(let ,(mapcar #'binding indices)
+         ,@body))))
+
 (defun version ()
   (print +version+))
+
+(defun slice (start end s &optional (sharedp *sharedp*))
+  (when s
+    (with-indices ((start 0) end) s
+      (let ((length (- end start)))
+        (cond
+          ((<= length 0) "")
+          ((not sharedp) (subseq s start end))
+          (t (make-array length
+                         :element-type (array-element-type s)
+                         :displaced-to s
+                         :displaced-index-offset start)))))))
+
+(let ((*index-mode* :wrap-clamp))
+  (assert (string= (slice -2 nil "abcdef" t) "ef")))
+
+;; internal
+(defun white-space-p (char)
+  (member char *whitespaces*))
+
+;; internal
+(defun trim-left-if (p s)
+  (if-let (beg (position-if-not p s))
+    (slice beg nil s)
+    ""))
+
+;; internal
+(defun trim-right-if (p s)
+  (if-let (end (position-if-not p s :from-end t))
+    (slice 0 (1+ end) s)
+    ""))
+
+;; internal
+(defun trim-if (p s)
+  (if-let ((beg (position-if-not p s))
+           (end (position-if-not p s :from-end t)))
+    (slice beg (1+ end) s)
+    ""))
 
 (defun trim-left (s)
   "Remove whitespaces at the beginning of s. "
   (when s
-    (string-left-trim *whitespaces* s)))
+    (trim-left-if #'white-space-p s)))
 
 (defun trim-right (s)
   "Remove whitespaces at the end of s."
   (when s
-    (string-right-trim *whitespaces* s)))
+    (trim-right-if #'white-space-p s)))
 
 (defun trim (s)
   "Remove whitespaces at the beginning and end of s.
@@ -153,23 +251,60 @@
 (trim \"  foo \") ;; => \"foo\"
 @end(code)"
   (when s
-    (string-trim *whitespaces* s)))
+    (trim-if #'white-space-p s)))
+
+(block :trim
+  (dolist (*index-mode* '(:clamp :strict :wrap-clamp :wrap-strict))
+    (dolist (*sharedp* '(nil t))
+      (loop 
+         for (test in out) 
+         in '((trim-left   "  	abcd"       "abcd")
+              (trim-left   "  	"             "")
+              (trim-right  "  	abcd"       "  	abcd")
+              (trim-right  "  	"             "")
+              (trim        "  	abcd"       "abcd")
+              (trim        "  	"             ""))
+         do (assert (string= out (funcall test in)) (test in out))))))
+
+(ppcre:do-scans (ms me rs re "abc" "xxxabcxxx"))
+
+(let (scanner ws-cache)
+  (defun whitespaces-scanner ()
+    (when (or (null scanner) (not (eq ws-cache *whitespaces*)))
+      (setf ws-cache *whitespaces*)
+      (setf scanner
+            (ppcre:create-scanner
+             `(:greedy-repetition 1 nil (:char-class ,@ws-cache)))))
+    scanner))
 
 (defun collapse-whitespaces (s)
   "Ensure there is only one space character between words.
   Remove newlines."
-  (ppcre:regex-replace-all "\\s+" s " "))
+  (let (matched)
+    (ppcre:do-scans (ms me rs re (whitespaces-scanner) s)
+      (declare (ignore rs re))
+      (setf matched t)
+      
+      ))
+  (ppcre:regex-replace-all "\\s+" s " ")))
 
 (defun concat (&rest strings)
   "Join all the string arguments into one string."
-  (apply #'concatenate 'string strings))
+  (flet ((process (strings) (apply #'concatenate 'string strings)))
+    (if *sharedp*
+        (let ((strings (remove-if #'emptyp strings)))
+          (cond
+            ((null strings) "")
+            ((null (rest strings)) (first strings))
+            (t (process strings))))
+        (process strings))))
 
 (defun join (separator strings)
   "Join all the strings of the list with a separator."
-  (let ((separator (replace-all "~" "~~" (string separator))))
-    (format nil
-            (concatenate 'string "~{~a~^" separator "~}")
-            strings)))
+  (if (and *sharedp* (not (rest strings)))
+      (first strings)
+      (let ((separator (replace-all "~" "~~" (string separator))))
+        (format nil (concat "~{~a~^" separator "~}") strings))))
 
 (defun insert (string/char index s)
   "Insert the given string (or character) at the `index' into `s' and return a new string.
@@ -186,9 +321,9 @@
      s)
     (t
      (concatenate 'string
-                  (subseq s 0 index)
+                  (slice 0 index s t)
                   string/char
-                  (subseq s index)))))
+                  (slice index nil s t)))))
 
 (defun split (separator s &key (omit-nulls *omit-nulls*) limit (start 0) end)
   "Split s into substring by separator (cl-ppcre takes a regex, we do not).
@@ -197,9 +332,10 @@
   split at most `limit' - 1 times)."
   ;; cl-ppcre:split doesn't return a null string if the separator appears at the end of s.
   (let* ((limit (or limit (1+ (length s))))
-         (res (cl-ppcre:split (cl-ppcre:quote-meta-chars (string separator)) s :limit limit :start start :end end)))
+         (res (cl-ppcre:split (cl-ppcre:quote-meta-chars (string separator))
+                              s :limit limit :start start :end end :sharedp *sharedp*)))
     (if omit-nulls
-        (remove-if (lambda (it) (empty? it)) res)
+        (delete-if #'empty? res)
         res)))
 
 (defun split-omit-nulls (separator s)
@@ -217,23 +353,8 @@ It uses `subseq' with differences:
 - `start' and `end' can be lower than 0 or bigger than the length of s.
 - for convenience `end' can be nil or t to denote the end of the string.
 "
-  (let* ((s-length (length s))
-         (end (cond
-                ((null end) s-length)
-                ((eq end t) s-length)
-                (t end))))
-    (setf start (max 0 start))
-    (if (> start s-length)
-        ""
-        (progn
-          (setf end (min end s-length))
-          (when (< end (- s-length))
-            (setf end 0))
-          (when (< end 0)
-            (setf end (+ s-length end)))
-          (if (< end start)
-              ""
-              (subseq s start end))))))
+  (let ((*index-mode* :clamp))
+    (slice start end s)))
 
 (defparameter *ellipsis* "..."
   "Ellipsis to add to the end of a truncated string (see `shorten').")
@@ -250,7 +371,7 @@ It uses `subseq' with differences:
     (let ((end (max (- len (length ellipsis))
                     0)))
       (setf s (concat
-               (subseq s 0 end)
+               (slice 0 end s t)
                ellipsis))))
   s)
 
