@@ -9,8 +9,7 @@
   :bug-tracker "https://github.com/vindarel/cl-str/issues"
   :source-control (:git "git@github.com:vindarel/cl-str.git")
   :description "Modern, consistent and terse Common Lisp string manipulation library."
-  :depends-on (:alexandria
-               :cl-ppcre
+  :depends-on (:cl-ppcre
                :cl-ppcre-unicode
                :cl-change-case)
   :components ((:file "str"))
